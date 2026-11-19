@@ -9,7 +9,8 @@ export async function interviewRequest<T>(path: string, token?: string, body?: u
   const abort = new AbortController();
   const timer = window.setTimeout(() => abort.abort(), 12000);
   try {
-    const response = await fetch('/api/interviews' + path, {
+    const apiRoot = path.startsWith('/auth') ? '/api' : '/api/interviews';
+    const response = await fetch(apiRoot + path, {
       method: method ?? (body === undefined ? 'GET' : 'POST'), headers,
       body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store', keepalive, signal: abort.signal,
     });
