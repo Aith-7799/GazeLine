@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.tmp_*
+.gazeline/
+*.sqlite
+*.sqlite-*
+.env
+.env.*
+.apper_tokens.json
+.mcp.json
+*.log
