@@ -1,9 +1,11 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { analyzeAudioFeatures } from './audioAnalysis.mjs';
 
 const base = '/api/interviews';
+const authBase = '/api/auth';
 const emptySnapshot = { monitoredMs: 0, calibrated: false, reviewRequested: false, events: [] };
 const eventCodes = new Set([
   'READING_DETECTED', 'TAB_SWITCH', 'LONG_AWAY', 'FULLSCREEN_EXIT', 'PASTE_EVENT',
@@ -21,6 +23,13 @@ function requireValue(condition, status, message) {
 }
 
 const digest = (value) => createHash('sha256').update(value).digest('hex');
+const passwordHash = (value, salt = randomBytes(16).toString('hex')) => `${salt}:${scryptSync(value, salt, 32).toString('hex')}`;
+function passwordMatches(value, stored) {
+  const [salt, expected] = String(stored || '').split(':');
+  if (!salt || !expected) return false;
+  const actual = scryptSync(value, salt, 32);
+  return timingSafeEqual(actual, Buffer.from(expected, 'hex'));
+}
 
 function shortText(value, limit, label) {
   requireValue(typeof value === 'string' && value.trim().length > 0 && value.trim().length <= limit,
@@ -94,9 +103,24 @@ export function createInterviewApi({ filename, interviewerPassword = process.env
     );
     CREATE INDEX IF NOT EXISTS interviews_by_creation ON interviews(created_at DESC);
     CREATE TABLE IF NOT EXISTS interviewer_access (token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL, created_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS user_sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS questions (id TEXT PRIMARY KEY, prompt TEXT NOT NULL, category TEXT NOT NULL, time_limit_seconds INTEGER NOT NULL, created_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS interview_questions (interview_id TEXT NOT NULL, question_id TEXT NOT NULL, position INTEGER NOT NULL, PRIMARY KEY(interview_id, question_id));
+    CREATE TABLE IF NOT EXISTS answers (id TEXT PRIMARY KEY, interview_id TEXT NOT NULL, question_id TEXT, candidate TEXT, answer_text TEXT, audio_path TEXT, timing_ms INTEGER, analysis TEXT, created_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS consent_events (id TEXT PRIMARY KEY, interview_id TEXT, candidate TEXT, camera INTEGER NOT NULL, microphone INTEGER NOT NULL, recording INTEGER NOT NULL, policy_version TEXT NOT NULL, created_at INTEGER NOT NULL);
   `);
   const byId = db.prepare('SELECT * FROM interviews WHERE id = ?');
   const hostAccess = db.prepare('SELECT 1 FROM interviewer_access WHERE token_hash = ? AND expires_at > ?');
+  const sessionUser = db.prepare('SELECT u.* FROM user_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?');
+  const seed = (username, password, role) => {
+    if (password && !db.prepare('SELECT 1 FROM users WHERE username=?').get(username)) {
+      db.prepare('INSERT INTO users VALUES (?,?,?,?,?)').run(randomBytes(16).toString('hex'), username, passwordHash(password), role, Date.now());
+    }
+  };
+  seed('int.demo', interviewerPassword, 'interviewer');
+  seed('cand.demo', process.env.GAZELINE_CANDIDATE_PASSWORD, 'candidate');
+  seed('admin.demo', process.env.GAZELINE_ADMIN_PASSWORD, 'admin');
   // Each read/check/write uses one transaction, including when two Node processes share the file.
   function transaction(work) {
     db.exec('BEGIN IMMEDIATE');
@@ -108,6 +132,41 @@ export function createInterviewApi({ filename, interviewerPassword = process.env
     const now = Date.now();
     const hash = token ? digest(token) : '';
     const host = () => requireValue(hash && hostAccess.get(hash, now), 401, 'Sign in as the interviewer to access saved interviews.');
+    const user = () => {
+      const row = sessionUser.get(hash, now);
+      requireValue(row, 401, 'Your account session has expired. Sign in again.');
+      return row;
+    };
+    if (path === '/login' && method === 'POST') {
+      const account = db.prepare('SELECT * FROM users WHERE username=?').get(shortText(body.username, 80, 'username'));
+      requireValue(account && passwordMatches(String(body.password || ''), account.password_hash), 401, 'Check your username and password.');
+      const access = randomBytes(32).toString('hex');
+      db.prepare('INSERT INTO user_sessions VALUES (?,?,?)').run(digest(access), account.id, now + 7 * 86400000);
+      return { token: access, user: { id: account.id, username: account.username, role: account.role } };
+    }
+    if (path === '/session' && method === 'GET') return user() && { username: user().username, role: user().role };
+    if (path === '/logout' && method === 'POST') { db.prepare('DELETE FROM user_sessions WHERE token_hash=?').run(hash); return {}; }
+    if (path === '/questions' && method === 'GET') { user(); return db.prepare('SELECT * FROM questions ORDER BY created_at DESC').all(); }
+    if (path === '/questions' && method === 'POST') {
+      const account = user(); requireValue(account.role === 'interviewer' || account.role === 'admin', 403, 'Interviewer access required.');
+      const q = { id: randomBytes(16).toString('hex'), prompt: shortText(body.prompt, 2000, 'question'), category: shortText(body.category || 'general', 80, 'category'), time_limit_seconds: Math.min(3600, Math.max(10, Number(body.timeLimitSeconds) || 120)) };
+      db.prepare('INSERT INTO questions VALUES (?,?,?,?,?)').run(q.id, q.prompt, q.category, q.time_limit_seconds, now); return q;
+    }
+    if (path === '/audio/analyze' && method === 'POST') { user(); return analyzeAudioFeatures(body); }
+    const answerMatch = /^\/([0-9a-f-]{36})\/answers$/.exec(path);
+    if (answerMatch && method === 'POST') {
+      const account = user(); requireValue(account.role === 'candidate', 403, 'Candidate access required.');
+      const answer = { id: randomBytes(16).toString('hex'), interview_id: answerMatch[1], question_id: body.questionId || null, candidate: shortText(body.candidate || account.username, 80, 'candidate name'), answer_text: typeof body.answerText === 'string' ? body.answerText.slice(0, 12000) : '', audio_path: null, timing_ms: Number.isSafeInteger(body.timingMs) ? body.timingMs : null, analysis: JSON.stringify(body.analysis || { status: 'pending' }), created_at: now };
+      db.prepare('INSERT INTO answers VALUES (?,?,?,?,?,?,?,?,?)').run(...Object.values(answer)); return answer;
+    }
+    const consentMatch = /^\/([0-9a-f-]{36})\/consent$/.exec(path);
+    if (consentMatch && method === 'POST') {
+      const account = user(); requireValue(account.role === 'candidate', 403, 'Candidate access required.');
+      const consent = { id: randomBytes(16).toString('hex'), interview_id: consentMatch[1], candidate: account.username, camera: body.camera === true ? 1 : 0, microphone: body.microphone === true ? 1 : 0, recording: body.recording === true ? 1 : 0, policy_version: shortText(body.policyVersion || '2026-01', 40, 'policy version'), created_at: now };
+      db.prepare('INSERT INTO consent_events VALUES (?,?,?,?,?,?,?)').run(...Object.values(consent)); return consent;
+    }
+    const reportMatch = /^\/([0-9a-f-]{36})\/report$/.exec(path);
+    if (reportMatch && method === 'GET') { host(); const interview = byId.get(reportMatch[1]); requireValue(interview, 404, 'Interview not found.'); return { interview: present(interview), questions: db.prepare('SELECT q.*, iq.position FROM questions q JOIN interview_questions iq ON iq.question_id=q.id WHERE iq.interview_id=? ORDER BY iq.position').all(reportMatch[1]), answers: db.prepare('SELECT * FROM answers WHERE interview_id=? ORDER BY created_at').all(reportMatch[1]), consents: db.prepare('SELECT * FROM consent_events WHERE interview_id=? ORDER BY created_at').all(reportMatch[1]) }; }
     if (path === '/access' && method === 'POST') {
       requireValue(body.username === 'int.demo' && body.password === interviewerPassword, 401, 'Check the interviewer username and password.');
       const access = randomBytes(32).toString('hex');
@@ -184,7 +243,9 @@ export function createInterviewApi({ filename, interviewerPassword = process.env
 
   async function middleware(req, res, next) {
     const pathname = (req.url || '/').split('?')[0];
-    if (pathname !== base && !pathname.startsWith(base + '/')) return next();
+    const apiBase = pathname === base || pathname.startsWith(base + '/') ? base :
+      (pathname === authBase || pathname.startsWith(authBase + '/') ? authBase : null);
+    if (!apiBase) return next();
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
     try {
@@ -194,7 +255,7 @@ export function createInterviewApi({ filename, interviewerPassword = process.env
       const token = /^Bearer ([a-f0-9]{64})$/.exec(req.headers.authorization || '')?.[1];
       const method = req.method;
       const body = method === 'POST' ? await readJson(req) : {};
-      const run = () => dispatch(method, pathname.slice(base.length), body, token);
+      const run = () => dispatch(method, pathname.slice(apiBase.length), body, token);
       const result = method === 'GET' ? run() : transaction(run);
       res.end(JSON.stringify(result));
     } catch (error) {
