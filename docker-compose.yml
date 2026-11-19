@@ -1,0 +1,11 @@
+services:
+  gazeline:
+    build: .
+    ports:
+      - "4173:4173"
+    env_file: .env
+    volumes:
+      - gazeline-data:/app/.gazeline
+volumes:
+  gazeline-data:
+
