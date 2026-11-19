@@ -3,6 +3,8 @@
 Interview-integrity monitoring application - webcam eye-tracking, microphone level meter,
 reading-pattern detection, SQLite-backed sessions, persistent reports, and a 3-role console.
 
+![GazeLine sign-in screen with the optical lens cover and role selector](docs/workspace.jpg)
+
 ## Stack & run
 
 Vite + TypeScript (vanilla, no framework). Eye tracking by
@@ -32,9 +34,13 @@ AASIST / speaker-verification worker. Until that worker is configured, the API e
 
 ## Demo accounts
 
-| Role | Username | Password |
+| Role | Username | Server password variable |
 |---|---|---|
-Set the local passwords in a .env file using .env.example. Passwords are intentionally excluded from source control.
+| Candidate | `cand.demo` | `GAZELINE_CANDIDATE_PASSWORD` |
+| Interviewer | `int.demo` | `GAZELINE_INTERVIEWER_PASSWORD` |
+| Admin | `admin.demo` | `GAZELINE_ADMIN_PASSWORD` |
+
+The sign-in screen lists demo usernames under **Demo usernames**. Supply the password variables to the server before its first run. To load them from a local `.env` file on Node 24, start development with `node --env-file=.env node_modules/vite/bin/vite.js`.
 
 ## Candidate flow
 
@@ -75,7 +81,7 @@ src/
     calibration.ts       # 17-point wizard overlay
     gazeOverlay.ts       # smoothed cursor + SVG trail, show/hide
     appHtml.ts           # view DOM (login / candidate / interviewer / admin)
-    styles.css           # dark ops-console theme
+    styles.css           # responsive workspace, calibration overlay and print styles
 tests/readingDetector.test.ts  # synthetic-trace unit tests
 ```
 

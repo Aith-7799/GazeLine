@@ -3,7 +3,8 @@ import { el, errorText, interviewRequest } from './interviewClient.js';
 import { formatDuration, type Interview, type InterviewSummary } from './interviewReport.js';
 
 const labels = { waiting: 'Awaiting candidate', active: 'In progress', completed: 'Completed', interrupted: 'Closed early', cancelled: 'Cancelled' };
-const formatDate = (value: number | null) => value === null ? '-' : new Date(value).toLocaleString();
+const formatter = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+const formatDate = (value: number | null) => value === null ? '—' : formatter.format(value);
 const prettyCode = (code: string) => code.match(/.{1,4}/g)!.join('-');
 const scoreText = (score: number | null) => score === null ? 'No monitoring data' : `${score} / 100`;
 const button = (action: string, label: string) => `<button class="btn" type="button" data-action="${action}">${label}</button>`;
@@ -14,9 +15,11 @@ function renderRow(s: InterviewSummary) {
   const actions = waiting ? button('invite', 'Copy invite') + button('close', 'Cancel interview')
     : s.status === 'active' ? button('report', 'View progress') + button('close', 'Close early')
     : s.status === 'cancelled' ? '' : button('report', 'Open report');
-  return `<tr data-id="${esc(s.id)}"><td><strong>${esc(s.title)}</strong><br><small>${esc(formatDate(s.createdAt))}</small></td>
-    <td>${esc(s.candidate ?? '-')}</td><td>${labels[s.status]}</td><td class="mono">${esc(detail)}</td>
-    <td><div class="interview-row-actions">${actions}</div></td></tr>`;
+  return `<tr data-id="${esc(s.id)}"><td class="interview-name"><strong>${esc(s.title)}</strong><br><small>${esc(formatDate(s.createdAt))}</small></td>
+    <td data-label="Candidate">${esc(s.candidate ?? '—')}</td>
+    <td data-label="Status"><span class="status-label status-${esc(s.status)}">${labels[s.status]}</span></td>
+    <td class="mono" data-label="${waiting ? 'Join code' : 'Score'}">${esc(detail)}</td>
+    <td class="row-actions"><div class="interview-row-actions">${actions}</div></td></tr>`;
 }
 
 function renderReport(s: Interview) {
@@ -96,7 +99,10 @@ export function bindInterviewDashboard(getToken: () => string | undefined) {
 
   async function refresh() {
     const token = getToken();
-    if (!token) return;
+    if (!token) {
+      el('interviews-empty').textContent = 'Sign in again to load your saved interviews.';
+      return;
+    }
     const version = ++loadVersion;
     try {
       const data = await interviewRequest<InterviewSummary[]>('', token);
@@ -106,7 +112,7 @@ export function bindInterviewDashboard(getToken: () => string | undefined) {
       if (html !== tableHtml) { el('interviews-list').innerHTML = html; tableHtml = html; }
       el('interviews-table').hidden = data.length === 0;
       el('interviews-empty').hidden = data.length > 0;
-      el('interviews-empty').textContent = 'Your first interview will appear here.';
+      el('interviews-empty').textContent = 'No interviews yet. Create an invitation to get started.';
       const current = data.find(row => row.id === selectionId);
       if (selected && current && current.updatedAt > selected.updatedAt) await showReport(current.id);
     } catch (error) {
@@ -148,7 +154,7 @@ export function bindInterviewDashboard(getToken: () => string | undefined) {
         const link = new URL(location.pathname, location.origin);
         link.hash = 'join=' + s.joinCode;
         try { await navigator.clipboard.writeText(link.href); feedback.textContent = 'Invitation link copied.'; }
-        catch { feedback.textContent = 'Invitation link � ' + link.href; }
+        catch { feedback.textContent = 'Invitation link · ' + link.href; }
         return;
       }
       const message = s.status === 'waiting' ? 'Cancel this invitation?' : 'Close this interview early and keep its last saved progress?';

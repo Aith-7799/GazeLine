@@ -7,7 +7,7 @@
  *  - BroadcastChannel feed (flags + reading cycles) and Admin live thresholds
  *  - debug plot + test paragraph for tuning the detector
  */
-import { buildApp, setAccounts, IFRAME_SVGS } from './appHtml.js';
+import { buildApp, workspaces, IFRAME_SVGS } from './appHtml.js';
 import { GazeTracker, CAL_CAPTURE_W, CAL_CAPTURE_H } from './tracker.js';
 import { runCalibrationWizard } from './calibration.js';
 import { pushGaze, pushNull, windowSlice, clear as clearBuffer, type BufferEntry } from '../gazeBuffer.js';
@@ -38,14 +38,6 @@ const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
 const pad2 = (n: number) => String(n).padStart(2, '0');
 const fmtClock = (ms: number) => `${pad2(Math.floor(ms / 60000))}:${pad2(Math.floor(ms / 1000) % 60)}`;
 
-/* ================= demo auth (client-side only, NOT secure) ================= */
-export const ACCOUNTS = [
-  { role: 'candidate', user: 'cand.demo', pass: import.meta.env.VITE_CANDIDATE_PASSWORD ?? '' },
-  { role: 'interviewer', user: 'int.demo', pass: import.meta.env.VITE_INTERVIEWER_PASSWORD ?? '' },
-  { role: 'admin', user: 'admin.demo', pass: import.meta.env.VITE_ADMIN_PASSWORD ?? '' },
-];
-setAccounts(ACCOUNTS);
-
 const ROLE_LABEL: Record<string, string> = { candidate: 'Candidate', interviewer: 'Interviewer', admin: 'Admin' };
 function initialsOf(name: string): string {
   const parts = name.split(/[^a-z0-9]+/i).filter(Boolean);
@@ -67,7 +59,7 @@ let interviewerToken: string | undefined;
 try {
   const raw = localStorage.getItem(SESSION_KEY);
   const parsed = raw ? JSON.parse(raw) : null;
-  if (parsed && ACCOUNTS.some((a) => a.role === parsed.role)) session = parsed;
+  if (parsed && workspaces.some(w => w.role === parsed.role)) session = parsed;
 } catch { session = null; }
 
 const VIEWS: Record<string, HTMLElement> = {
@@ -88,45 +80,69 @@ function show(view: string): void {
   window.scrollTo(0, 0);
 }
 
-/* login form */
-let loginRole = 'candidate';
+const privacyDialog = document.querySelector<HTMLDialogElement>('#privacy-dialog')!;
+$('#open-privacy').addEventListener('click', () => privacyDialog.showModal());
+
+const loginForm = document.querySelector<HTMLFormElement>('#login-form')!;
+const loginButton = document.querySelector<HTMLButtonElement>('#login-submit')!;
+const usernameInput = document.querySelector<HTMLInputElement>('#login-user')!;
+const passwordInput = document.querySelector<HTMLInputElement>('#login-pass')!;
+const visibilityButton = $('#toggle-password');
+let loginRole: typeof workspaces[number]['role'] = 'candidate';
+
+function setPasswordVisible(visible: boolean): void {
+  passwordInput.type = visible ? 'text' : 'password';
+  visibilityButton.setAttribute('aria-pressed', String(visible));
+}
+visibilityButton.addEventListener('click', () => setPasswordVisible(passwordInput.type === 'password'));
+for (const radio of loginForm.querySelectorAll<HTMLInputElement>('input[name="role"]')) {
+  radio.addEventListener('change', () => {
+    const selected = workspaces.find(w => w.role === radio.value)!;
+    loginRole = selected.role;
+    $('#role-hint').textContent = selected.hint;
+    usernameInput.placeholder = `e.g. ${selected.username}`;
+    loginButton.textContent = `Sign in as ${loginRole}`;
+    $('#login-error').hidden = true;
+  });
+}
 $('#login-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
-  const u = ($('#login-user') as HTMLInputElement).value.trim();
-  const p = ($('#login-pass') as HTMLInputElement).value;
+  if (loginButton.disabled) return;
+  const u = usernameInput.value.trim();
+  const p = passwordInput.value;
   const errEl = $('#login-error');
+  errEl.hidden = true;
+  loginButton.disabled = true;
+  loginButton.textContent = 'Signing in…';
   try {
     const auth = await interviewRequest<{ token: string; user: { role: string; username: string } }>('/auth/login', undefined, { username: u, password: p });
-    session = { role: auth.user.role, name: auth.user.username };
     if (auth.user.role === 'interviewer') {
       const legacy = await interviewRequest<{ token: string }>('/access', undefined, { username: u, password: p });
       interviewerToken = legacy.token;
     }
+    session = { role: auth.user.role, name: auth.user.username };
     try { localStorage.setItem(SESSION_KEY, JSON.stringify(session)); } catch { /* ignore */ }
-    errEl.style.display = 'none';
+    passwordInput.value = '';
+    setPasswordVisible(false);
     enterRole();
   } catch (error) {
     errEl.textContent = error instanceof Error ? error.message : 'Sign-in failed.';
-    errEl.style.display = 'block';
+    errEl.hidden = false;
+  } finally {
+    loginButton.disabled = false;
+    loginButton.textContent = `Sign in as ${loginRole}`;
   }
 });
-for (const tab of document.querySelectorAll<HTMLElement>('.role-tab')) {
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('.role-tab').forEach((t) => { t.classList.remove('active'); t.setAttribute('aria-selected', 'false'); });
-    tab.classList.add('active');
-    tab.setAttribute('aria-selected', 'true');
-    loginRole = tab.dataset.role!;
-    $('#login-submit').textContent = `Sign in as ${loginRole}`;
-    $('#login-error').style.display = 'none';
-  });
-}
 
 $('#btn-logout').addEventListener('click', () => {
   if (session?.role === 'candidate') candidateTeardown('logout');
   bcSendBye();
+  interviewerToken = undefined;
+  interviewerDashboard.reset();
   session = null;
   try { localStorage.removeItem(SESSION_KEY); } catch { /* ignore */ }
   show('login');
+  usernameInput.focus();
 });
 
 function enterRole(): void {
@@ -181,7 +197,7 @@ function renderFeed(): void {
   if (session?.role !== 'interviewer') return;
   const rows = [...feed.values()].sort((a, b) => b.ts - a.ts);
   $('#feed-table').style.display = rows.length ? 'table' : 'none';
-  $('#feed-empty').style.display = rows.length ? 'none' : 'block';
+  $('#feed-empty').hidden = rows.length > 0;
   $('#feed-count').textContent = `${rows.length} live`;
   const tb = $('#feed-rows');
   tb.innerHTML = rows.map((r) => {
@@ -195,7 +211,7 @@ function renderFeed(): void {
       <td class="mono">${r.score}</td>
       <td><span class="tier ${r.tier.toLowerCase()}">${r.tier}</span></td>
       <td>${flagTxt}</td>
-      <td class="mono">${r.readingCycles} � ${(r.readingLik * 100).toFixed(0)}%</td>
+      <td class="mono">${r.readingCycles} · ${(r.readingLik * 100).toFixed(0)}%</td>
       <td>${r.micActive ? '<span class="voice">Voice</span>' : '<span class="mono-dim">Quiet</span>'}</td>
       <td><span class="live">Live</span></td>
     </tr>`;
@@ -445,9 +461,9 @@ function broadcastCfg(): void {
   $('#saw-rise-max-out').textContent = `${sawRiseMax.toFixed(1)} s`;
   $('#saw-ret-max-out').textContent = `${sawRetMax.toFixed(1)} s`;
   $('#cfg-readout').textContent =
-    `active: amp � ${amp.toFixed(2)} (${amp * 100 | 0}% width / � ${pxFloor} px) � ` +
-    `pass ${pmin.toFixed(1)}-${pmax.toFixed(1)} s � passes � ${passes} � cycles � ${cyc} � window ${win.toFixed(1)} s � ` +
-    `overlap ${overlap.toFixed(2)} � y-band ${yband.toFixed(2)} � ${lowGaze ? 'low-gaze on' : 'low-gaze off'} � sawtooth ${sawEnabled ? 'on' : 'off'} (${sawWin.toFixed(0)}s window, ${sawCyc} cycles)`;
+    `active: amp ≥ ${amp.toFixed(2)} (${amp * 100 | 0}% width / ≥ ${pxFloor} px) · ` +
+    `pass ${pmin.toFixed(1)}-${pmax.toFixed(1)} s · passes ≥ ${passes} · cycles ≥ ${cyc} · window ${win.toFixed(1)} s · ` +
+    `overlap ${overlap.toFixed(2)} · y-band ${yband.toFixed(2)} · ${lowGaze ? 'low-gaze on' : 'low-gaze off'} · sawtooth ${sawEnabled ? 'on' : 'off'} (${sawWin.toFixed(0)}s window, ${sawCyc} cycles)`;
 }
 function syncAdminInputsFromRemote(): void {
   const r = remoteCfg;
@@ -525,7 +541,8 @@ function applyIntegrityCfg(cfg: any): void {
 function echoCfg(): void {
   const c = getCfg();
   $('#cfg-echo').textContent = `${(c.passMsMin / 1000).toFixed(1)}-${(c.passMsMax / 1000).toFixed(1)} s`;
-  $('#cfg-echo-amp').textContent = `${(c.minAmpFrac * 100).toFixed(0)}% / � ${c.ampPxFloor} px`;
+  $('#cfg-echo-amp').textContent = `${(c.minAmpFrac * 100).toFixed(0)}%`;
+  $('#cfg-echo-pxf').textContent = String(c.ampPxFloor);
   $('#cfg-echo-rep').textContent = String(c.requiredPasses);
   $('#cfg-echo-cyc').textContent = String(c.requiredCycles);
   $('#cfg-echo-cd').textContent = `${c.cooldownMs / 1000} s`;
@@ -803,7 +820,7 @@ async function startCalibration(): Promise<void> {
     ($('#setup-panel') as HTMLElement).style.display = 'none';
     ($('#tracking-panel') as HTMLElement).style.display = '';
     $('#track-sub').textContent = `calibrated with ${r.samples.length} samples`;
-    $('#gaze-calstate').textContent = `calibrated � ${r.samples.length} samples`;
+    $('#gaze-calstate').textContent = `calibrated · ${r.samples.length} samples`;
     setGazeOverlayVisible(true);
     $('#btn-toggle-cursor').textContent = 'Hide';
   } catch (e) {
@@ -904,7 +921,7 @@ function startMicMeter(): void {
       const pct = clamp((db + 90) / 70 * 100, 0, 100);
       meterEl.style.width = `${pct.toFixed(1)}%`;
       $('#meter').setAttribute('aria-valuenow', pct.toFixed(0));
-      $('#mic-readout').textContent = `${db.toFixed(0)} dBFS � ${candidate.micActive ? 'voice activity' : 'silence'}`;
+      $('#mic-readout').textContent = `${db.toFixed(0)} dBFS · ${candidate.micActive ? 'voice activity' : 'silence'}`;
       micRaf = requestAnimationFrame(loop);
     };
     loop();
@@ -1239,7 +1256,7 @@ function updateReadingUI(res: ReadingDetectionResult): void {
     v.textContent = 'no reading pattern';
     v.style.color = '';
   }
-  $('#read-cycles').textContent = `${res.passCount} of ${getCfg().requiredPasses} passes � ${res.cycles} cycles`;
+  $('#read-cycles').textContent = `${res.passCount} of ${getCfg().requiredPasses} passes · ${res.cycles} cycles`;
   $('#read-region-mode').textContent = res.region?.mode ?? '-';
   $('#read-lowgaze').textContent = res.lowGaze ? 'yes' : 'no';
   $('#penalty-val').textContent = candidate.scoreState.score < 100 ? `-${100 - candidate.scoreState.score} pts from ${candidate.scoreState.flagLog.length} event(s)` : candidate.warnShown ? 'warning shown' : '-';
@@ -1257,12 +1274,12 @@ function updateReadingUI(res: ReadingDetectionResult): void {
       .join('');
   }
   $('#read-lik').textContent =
-    `${(candidate.reading.likelihood * 100).toFixed(0)}% � null ${Math.round(res.nullRatio * 100)}%`;
+    `${(candidate.reading.likelihood * 100).toFixed(0)}% · null ${Math.round(res.nullRatio * 100)}%`;
   const log = $('#read-log');
   log.textContent =
-    `window: ${(getCfg().windowMs / 1000).toFixed(1)}s � amp � ${(getCfg().minAmpFrac * 100).toFixed(0)}% width � ` +
-    `pass ${(getCfg().passMsMin / 1000).toFixed(1)}-${(getCfg().passMsMax / 1000).toFixed(1)}s � ` +
-    `passes � ${getCfg().requiredPasses} (cycles � ${getCfg().requiredCycles})\n` +
+    `window: ${(getCfg().windowMs / 1000).toFixed(1)}s · amp ≥ ${(getCfg().minAmpFrac * 100).toFixed(0)}% width · ` +
+    `pass ${(getCfg().passMsMin / 1000).toFixed(1)}-${(getCfg().passMsMax / 1000).toFixed(1)}s · ` +
+    `passes ≥ ${getCfg().requiredPasses} (cycles ≥ ${getCfg().requiredCycles})\n` +
     `${res.reason}\n` +
     `samples: ${res.validSamples} valid / ${res.totalSamples} total (null ${Math.round(res.nullRatio * 100)}%)\n` +
     `verdict: ${candidate.flags.READING_PATTERN_DETECTED ? 'READING_PATTERN_DETECTED' : 'not flagged'}`;
@@ -1351,7 +1368,7 @@ function drawPlot(res: ReadingDetectionResult): void {
     iN++;
     void iN;
   }
-  $('#plot-sub').textContent = `${res.runs.filter((r) => r.kind === 1).length} passes � ${res.runs.filter((r) => r.kind === -1).length} returns � ${res.cycles} cycles`;
+  $('#plot-sub').textContent = `${res.runs.filter((r) => r.kind === 1).length} passes · ${res.runs.filter((r) => r.kind === -1).length} returns · ${res.cycles} cycles`;
 }
 
 /* ================= test mode ================= */
