@@ -90,26 +90,23 @@ function show(view: string): void {
 
 /* login form */
 let loginRole = 'candidate';
-$('#login-form').addEventListener('submit', (ev) => {
+$('#login-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const u = ($('#login-user') as HTMLInputElement).value.trim();
   const p = ($('#login-pass') as HTMLInputElement).value;
-  const acct = ACCOUNTS.find((a) => a.role === loginRole)!;
   const errEl = $('#login-error');
-  if (u === acct.user && p === acct.pass) {
-    session = { role: acct.role, name: u };
+  try {
+    const auth = await interviewRequest<{ token: string; user: { role: string; username: string } }>('/auth/login', undefined, { username: u, password: p });
+    session = { role: auth.user.role, name: auth.user.username };
+    if (auth.user.role === 'interviewer') {
+      const legacy = await interviewRequest<{ token: string }>('/access', undefined, { username: u, password: p });
+      interviewerToken = legacy.token;
+    }
     try { localStorage.setItem(SESSION_KEY, JSON.stringify(session)); } catch { /* ignore */ }
     errEl.style.display = 'none';
-    if (acct.role === 'interviewer') {
-      void interviewRequest<{ token: string }>('/access', undefined, { username: u, password: p }).then((r) => {
-        interviewerToken = r.token;
-        enterRole();
-      }).catch(() => { errEl.textContent = 'Interviewer access could not be established.'; errEl.style.display = 'block'; });
-    } else {
-      enterRole();
-    }
-  } else {
-    errEl.textContent = `That username and password don't match the ${loginRole} account. Use one of the demo accounts listed below.`;
+    enterRole();
+  } catch (error) {
+    errEl.textContent = error instanceof Error ? error.message : 'Sign-in failed.';
     errEl.style.display = 'block';
   }
 });
