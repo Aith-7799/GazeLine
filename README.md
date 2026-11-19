@@ -1,7 +1,7 @@
 # GAZELINE
 
-Interview-integrity monitoring prototype - webcam eye-tracking, microphone level meter,
-reading-pattern detection, and a 3-role console (Candidate / Interviewer / Admin), all client-side.
+Interview-integrity monitoring application - webcam eye-tracking, microphone level meter,
+reading-pattern detection, SQLite-backed sessions, persistent reports, and a 3-role console.
 
 ## Stack & run
 
@@ -16,7 +16,19 @@ npm run dev        # http://localhost:5173 - secure context, getUserMedia works
 npm run test       # vitest unit tests (synthetic gaze traces)
 npm run typecheck  # tsc --noEmit
 npm run build      # production bundle
+npm run start      # serve the production bundle on 0.0.0.0:4173
 ```
+
+## Production services
+
+The Vite API plugin persists interviews, questions, answers, consent history, and reports in
+`.gazeline/interviews.sqlite`. Set server passwords in `.env` from `.env.example`; the browser
+never receives those secrets. `Dockerfile` and `docker-compose.yml` provide a deployment with a
+persistent data volume, while the GitHub workflow runs typecheck, tests, and the production build.
+
+The `/api/interviews/audio/analyze` endpoint is the integration boundary for a separately deployed
+AASIST / speaker-verification worker. Until that worker is configured, the API explicitly reports
+`metadata-fallback` and does not claim neural anti-spoofing results.
 
 ## Demo accounts
 
@@ -74,10 +86,10 @@ null-ratio guard.
 
 ## Privacy
 
-Everything runs in the browser: no video, audio, or gaze data is uploaded anywhere. The
-Interviewer console is fed by `BroadcastChannel` between tabs of the same browser only.
-Gaze accuracy is ~120 CSS px after 17-point calibration - the cursor is region-level, not pixel-perfect.
-Desktop only (warning banner on mobile, where accuracy is significantly reduced).
+Monitoring summaries are persisted only after a candidate joins a server-backed session. Consent
+events record camera, microphone, and recording choices with a policy version. Raw camera frames
+and gaze samples are not persisted. Audio analysis is opt-in and should be deployed with an explicit
+retention policy; reports can be printed or saved as PDF from the report view.
 
 ## License notes
 
