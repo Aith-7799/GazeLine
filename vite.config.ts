@@ -1,9 +1,10 @@
 /// <reference types="vitest" />
 import { defineConfig } from 'vite';
+import { gazeRuntime } from './server/gazeRuntime.mjs';
 import { interviewApiPlugin } from './server/interviews.mjs';
 
 export default defineConfig({
-  plugins: process.env.VITEST ? [] : [interviewApiPlugin()],
+  plugins: process.env.VITEST ? [] : [gazeRuntime(), interviewApiPlugin()],
   server: {
     port: 5173, strictPort: false,
     fs: { deny: ['**/.*', '**/.*/**', '**/*.{crt,pem,sqlite,sqlite-wal,sqlite-shm}'] },

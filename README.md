@@ -9,13 +9,15 @@ reading-pattern detection, SQLite-backed sessions, persistent reports, and a 3-r
 
 Vite + TypeScript (vanilla, no framework). Eye tracking by
 [`@realeye-io/webcam-eyetracker-light-open`](https://github.com/RealEye-io/webcam-eyetracker-light-open)
-(MediaPipe + custom ridge regression). Models and the WASM runtime load from CDN by default -
-no local model files are needed.
+(MediaPipe + custom ridge regression). GazeLine serves the matching MediaPipe WASM runtime
+with the app. The face landmark model downloads from Google's model storage on first use.
 
 ```bash
 npm install
 npm run dev        # http://localhost:5173 - secure context, getUserMedia works
-npm run test       # vitest unit tests (synthetic gaze traces)
+npm test           # gaze and interview regression tests
+npx playwright install chromium  # one-time setup for browser tests
+npm run test:calibration         # target bounds, retry and resize in Chromium
 npm run typecheck  # tsc --noEmit
 npm run build      # production bundle
 npm run start      # serve the production bundle on 0.0.0.0:4173
@@ -46,7 +48,7 @@ The sign-in screen lists demo usernames under **Demo usernames**. Supply the pas
 
 1. **Sign in** (Candidate role)  **consent gate**: camera + mic permissions; nothing monitoring-related starts before both are granted.
 2. **Setup**: live preview + face-detected badge. *Start calibration* is disabled until a face is seen.
-3. **Calibration wizard**: full-screen overlay, one target at a time across the 17-point grid (`getRecommendedPattern()`  `getCalibrationPointsInPixels(...)`), progress `7/17`, click or hold-space to capture, redo/restart any time. `calibrate(samples)` needs � 5 samples; the wizard collects all 17.
+3. **Calibration** shows 17 dots inside the visible browser area. Look at each dot and click it or hold Space. A missed face keeps the same dot active. Resizing the window restarts the grid so all samples use the same coordinates.
 4. **Tracking**: live gaze cursor + fading trail (toggleable), readout panel (x/y, fps, face-lost indicator, GPU/CPU delegate), *Recalibrate* button. GPU init falls back to CPU automatically.
 
 ## Reading-pattern detection

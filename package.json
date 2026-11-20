@@ -12,12 +12,14 @@
     "start": "vite preview --host 0.0.0.0",
     "typecheck": "tsc --noEmit",
     "test": "vitest run && node --test server/interviews.test.mjs",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:calibration": "playwright test --config tests/browser/config.mjs"
   },
   "dependencies": {
     "@realeye-io/webcam-eyetracker-light-open": "^1.1.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
     "typescript": "^5.4.5",
     "vite": "^5.4.0",
     "vitest": "^1.6.0"

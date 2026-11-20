@@ -8,18 +8,19 @@
  *  - debug plot + test paragraph for tuning the detector
  */
 import { buildApp, workspaces, IFRAME_SVGS } from './appHtml.js';
-import { GazeTracker, CAL_CAPTURE_W, CAL_CAPTURE_H } from './tracker.js';
+import { GazeTracker, CAL_CAPTURE_W, CAL_CAPTURE_H, type PredictResult } from './tracker.js';
 import { runCalibrationWizard } from './calibration.js';
+import { visibleGazePoint } from './viewport.js';
 import { pushGaze, pushNull, windowSlice, clear as clearBuffer, type BufferEntry } from '../gazeBuffer.js';
-import { analyze, updateBaseline, DEFAULT_READING_CFG, type ReadingDetectionConfig, type ReadingDetectionResult, type ReadingRegion } from '../readingDetector.js';import { startGazeOverlay, stopGazeOverlay, setGazeOverlayVisible, isGazeOverlayVisible } from './gazeOverlay.js';
-import type { FaceLandmarkerResult } from './tracker.js';
+import { analyze, updateBaseline, DEFAULT_READING_CFG, type ReadingDetectionConfig, type ReadingDetectionResult, type ReadingRegion } from '../readingDetector.js';
+import { startGazeOverlay, stopGazeOverlay, clearGazeOverlay, setGazeOverlayVisible, isGazeOverlayVisible } from './gazeOverlay.js';
 
 /* ================= integrity modules ================= */
 import { FacePipeline } from '../integrity/facePipeline.js';
 import { SetupGate, DEFAULT_SETUP_CFG, type SetupQualitySummary } from '../integrity/setupGate.js';
 import { AttentionMonitor, type AttentionEvent } from '../integrity/attentionMonitor.js';
-import { FaceMonitor, type FaceMonitorEvent } from '../integrity/faceMonitor.js';
-import { HeadPoseTracker, type HeadPoseEvent } from '../integrity/headPose.js';
+import { FaceMonitor } from '../integrity/faceMonitor.js';
+import { HeadPoseTracker } from '../integrity/headPose.js';
 import { BlinkAnalyzer, type BlinkAnalyzerEvent } from '../integrity/blinkAnalyzer.js';
 import { DEFAULT_SCORING_CFG, initialScoreState, applyDeduction, type IntegrityEvent } from '../integrity/types.js';
 import { bindInterviewDashboard } from './interviewDashboard.js';
@@ -135,7 +136,7 @@ $('#login-form').addEventListener('submit', async (ev) => {
 });
 
 $('#btn-logout').addEventListener('click', () => {
-  if (session?.role === 'candidate') candidateTeardown('logout');
+  if (session?.role === 'candidate') candidateTeardown();
   bcSendBye();
   interviewerToken = undefined;
   interviewerDashboard.reset();
@@ -594,12 +595,7 @@ const candidateInterview = bindCandidateInterview({
     candidate.scoreState, performance.now(), candidate.calibrated, candidate.scoreState.reviewFlagged,
   ),
   stopCapture: () => {
-    tracker.stop();
-    candidate.tracking = false;
-    candidate.streaming = false;
-    for (const id of [tickTimer, analysisTimer, faceCheckTimer]) window.clearInterval(id);
-    tickTimer = analysisTimer = faceCheckTimer = 0;
-    if (micRaf) { cancelAnimationFrame(micRaf); micRaf = 0; }
+    stopCandidateDevices();
     candidateInterview.setCapturing(false);
   },
 });
@@ -608,7 +604,9 @@ const tracker = new GazeTracker();
 let mediaStream: MediaStream | null = null;
 let micRaf = 0;
 let tickTimer = 0;
-let faceCheckTimer = 0;
+let captureSession: AbortController | null = null;
+let cameraFps = 0;
+let gazeLive = false;
 let analysisTimer = 0;
 
 const NO_FACE_MS = 3500;
@@ -641,15 +639,27 @@ function setDeny(err: unknown): void {
   } else {
     msg = 'Could not acquire camera + microphone. Both permissions are required; no degraded monitoring mode is available.';
   }
+  $('#deny-stage').textContent = 'Device access';
+  $('#deny-help').textContent = 'Check camera and microphone access in your browser, then try again.';
   $('#deny-reason').textContent = msg;
 }
 
 async function requestStart(): Promise<void> {
   if (!navigator.mediaDevices?.getUserMedia) { setDeny(null); return; }
+  if (captureSession || !candidateInterview.canStart()) return;
+  const owner = new AbortController();
+  captureSession = owner;
   try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-  } catch (e) {
-    setDeny(e);
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    if (owner.signal.aborted) {
+      stream.getTracks().forEach(track => track.stop());
+      return;
+    }
+    mediaStream = stream;
+  } catch (error) {
+    if (owner.signal.aborted) return;
+    captureSession = null;
+    setDeny(error);
     return;
   }
   ($('#gate-ask') as HTMLElement).style.display = 'none';
@@ -668,21 +678,30 @@ async function requestStart(): Promise<void> {
   video.muted = true; video.playsInline = true; video.autoplay = true;
   video.id = 'preview-video';
   shell.insertBefore(video, shell.firstChild);
-  await video.play();
-
-  /* tracker init (GPU  CPU fallback handled inside) */
-  await tracker.ensureVideo(mediaStream);
+  $('#face-badge').textContent = 'Loading gaze trackerâ€¦';
+  $('#setup-sub').textContent = 'Loading gaze trackerâ€¦';
+  ($('#btn-start-cal') as HTMLButtonElement).disabled = true;
   try {
-    await tracker.initialize();
-  } catch (e) {
-    $('#track-sub').textContent = 'tracker init failed';
-    console.error('[gazeline] tracker init failed', e);
+    await video.play();
+    owner.signal.throwIfAborted();
+    await tracker.initialize(video, owner.signal);
+  } catch (error) {
+    if (owner.signal.aborted) return;
+    stopCandidateDevices();
+    candidateInterview.setCapturing(false);
+    $('#gate-ask').style.display = 'none';
+    $('#gate-denied').style.display = '';
+    $('#deny-stage').textContent = 'Gaze tracker';
+    $('#deny-reason').textContent = 'The gaze tracker could not start.';
+    $('#deny-help').textContent = 'Check your connection and try again to reload the face model.';
+    console.error('[gazeline] Gaze initialization failed', error);
     return;
   }
+  if (owner.signal.aborted) return;
   $('#gaze-delegate').textContent = tracker.activeDelegate;
   $('#gaze-calstate').textContent = 'not calibrated - run the wizard';
 
-  tracker.onFps = (fps) => { $('#gaze-fps').textContent = `${fps} fps`; };
+  tracker.onFps = fps => { cameraFps = fps; $('#gaze-fps').textContent = `${fps} fps`; };
   tracker.onResult = onTrackerResult;
   tracker.start();
 
@@ -699,40 +718,6 @@ async function requestStart(): Promise<void> {
   candidate.blinkRateDropActive = false;
   candidate.extraDisplayFlagged = false;
 
-  // Wire up event listeners
-
-  // Attention events
-  candidate.attentionMonitor.onEvent((ev: AttentionEvent) => {
-    handleIntegrityEvent(ev);
-    // Mark gaze data around tab switch as unreliable
-    if (ev.code === 'TAB_SWITCH' || ev.code === 'LONG_AWAY') {
-      const unreliableWindow = candidate.attentionMonitor.getUnreliableWindowMs();
-      markGazeUnreliable(unreliableWindow);
-    }
-  });
-
-  // Face monitor events
-  candidate.faceMonitor.onEvent((ev: FaceMonitorEvent) => {
-    handleIntegrityEvent(ev);
-  });
-
-  // Head pose events
-  candidate.headPose.onEvent((ev: HeadPoseEvent) => {
-    handleIntegrityEvent(ev);
-  });
-
-  // Blink analyzer events
-  candidate.blinkAnalyzer.onEvent((ev: BlinkAnalyzerEvent) => {
-    handleIntegrityEvent(ev);
-    if (ev.code === 'BLINK_RATE_DROP') {
-      candidate.blinkRateDropActive = true;
-    }
-    if (ev.code === 'BLINK_REGULARITY_ANOMALY') {
-      // Supporting evidence only, no deduction
-      logFlagText(`${ev.code} (supporting evidence)`);
-    }
-  });
-
   candidate.faceMonitor.setSessionStart(performance.now());
   candidate.blinkAnalyzer.startBaseline(performance.now());
   candidate.headPose.startCalibration(performance.now());
@@ -740,99 +725,94 @@ async function requestStart(): Promise<void> {
   // Start DOM event listeners for attention monitor
   candidate.attentionMonitor.start();
 
-  /* setup step: poll face presence until found, then enable the wizard button */
-  $('#face-badge').textContent = 'checking.';
-  faceCheckTimer = window.setInterval(() => {
-    if (!candidate.streaming || candidate.tracking || candidate.calibrating) return;
-    const present = tracker.facePresent();
-    $('#face-badge').textContent = present ? 'face detected' : 'no face';
-    $('#face-badge').classList.toggle('ok', present);
-    $('#face-badge').classList.toggle('bad', !present);
-    const btn = $('#btn-start-cal') as HTMLButtonElement;
-    if (present && btn.disabled) {
-      btn.disabled = false;
-      $('#setup-sub').textContent = 'ready';
-    } else if (!present) {
-      $('#setup-sub').textContent = 'waiting for face.';
-    }
-  }, 500);
-
-  $('#btn-start-cal').addEventListener('click', startCalibration);
-  $('#btn-recal').addEventListener('click', () => { void startCalibration(); });
-  $('#btn-toggle-cursor').addEventListener('click', () => {
-    setGazeOverlayVisible(!isGazeOverlayVisible());
-    $('#btn-toggle-cursor').textContent = isGazeOverlayVisible() ? 'Hide' : 'Show';
-  });
-  $('#btn-testmode').addEventListener('click', toggleTestMode);
   startGazeOverlay();
 }
 
+candidate.attentionMonitor.onEvent((ev: AttentionEvent) => {
+  handleIntegrityEvent(ev);
+  if (ev.code === 'TAB_SWITCH' || ev.code === 'LONG_AWAY') {
+    markGazeUnreliable(candidate.attentionMonitor.getUnreliableWindowMs());
+  }
+});
+candidate.faceMonitor.onEvent(handleIntegrityEvent);
+candidate.headPose.onEvent(handleIntegrityEvent);
+candidate.blinkAnalyzer.onEvent((ev: BlinkAnalyzerEvent) => {
+  handleIntegrityEvent(ev);
+  if (ev.code === 'BLINK_RATE_DROP') candidate.blinkRateDropActive = true;
+  if (ev.code === 'BLINK_REGULARITY_ANOMALY') logFlagText(`${ev.code} (supporting evidence)`);
+});
+
+$('#btn-start-cal').addEventListener('click', startCalibration);
+$('#btn-recal').addEventListener('click', startCalibration);
+$('#btn-toggle-cursor').addEventListener('click', () => {
+  setGazeOverlayVisible(!isGazeOverlayVisible());
+  $('#btn-toggle-cursor').textContent = isGazeOverlayVisible() ? 'Hide' : 'Show';
+});
+$('#btn-testmode').addEventListener('click', toggleTestMode);
 $('#btn-enable').addEventListener('click', () => { void requestStart(); });
 $('#btn-retry').addEventListener('click', () => { void requestStart(); });
 
 /* ================= calibration orchestration ================= */
 async function startCalibration(): Promise<void> {
-  if (candidate.calibrating || !tracker.initialized) return;
-
-  // Complete setup gate before calibration
+  const owner = captureSession;
+  if (!owner || candidate.calibrating || !tracker.initialized || !candidate.streaming) return;
+  const button = $('#btn-start-cal') as HTMLButtonElement;
   if (!candidate.setupGate.done) {
-    candidate.setupQuality = candidate.setupGate.complete();
-    if (!candidate.setupGate.allRequiredPass()) {
-      // Show setup warnings but allow override via Continue Anyway button
-      $('#setup-sub').textContent = `setup: ${candidate.setupQuality.overall} - fix issues or continue anyway`;
-      // Auto-enable after a short delay if user doesn't override
-      setTimeout(() => {
-        if (!candidate.setupGate.done && candidate.streaming) {
-          candidate.setupOverride = true;
-          candidate.setupGate._ready = true; // force ready
-          candidate.setupGate._done = true;
-          $('#setup-sub').textContent = 'setup overridden - proceed with caution';
-        }
-      }, 3000);
+    if (!candidate.setupGate.allRequiredPass() && !candidate.setupOverride) {
+      candidate.setupOverride = true;
+      $('#setup-sub').textContent = 'Check your framing and lighting, or continue with this setup.';
+      button.textContent = 'Continue to calibration';
       return;
     }
+    candidate.setupQuality = candidate.setupGate.complete();
   }
-
   candidate.calibrating = true;
-  ($('#btn-start-cal') as HTMLButtonElement).disabled = true;
-  $('#setup-sub').textContent = 'calibrating.';
-  const r = await runCalibrationWizard(tracker);
-  candidate.calibrating = false;
-  if (r.cancelled) {
-    ($('#btn-start-cal') as HTMLButtonElement).disabled = false;
-    $('#setup-sub').textContent = 'calibration cancelled';
-    return;
-  }
-  if (!r.ok || r.samples.length < 5) {
-    $('#setup-sub').textContent = `calibration failed (${r.reason ?? 'not enough samples'})`;
-    ($('#btn-start-cal') as HTMLButtonElement).disabled = false;
-    return;
-  }
+  gazeLive = false;
+  const previousVisibility = isGazeOverlayVisible();
+  setGazeOverlayVisible(false);
+  clearBuffer();
+  button.disabled = true;
+  const status = candidate.tracking ? $('#track-sub') : $('#setup-sub');
+  status.textContent = 'Calibratingâ€¦';
   try {
-    tracker.calibrate(r.samples);
+    const samples = await runCalibrationWizard(tracker, owner.signal);
+    if (owner.signal.aborted) return;
+    if (!samples) {
+      status.textContent = 'Calibration cancelled.';
+      setGazeOverlayVisible(previousVisibility);
+      return;
+    }
+    tracker.calibrate(samples);
     candidate.calibrated = true;
     candidate.tracking = true;
-
-    // Start baseline capture for blink rate and head pose
     candidate.blinkAnalyzer.startBaseline(performance.now());
     candidate.headPose.startCalibration(performance.now());
     candidate.faceMonitor.setSessionStart(performance.now());
-    ($('#setup-panel') as HTMLElement).style.display = 'none';
-    ($('#tracking-panel') as HTMLElement).style.display = '';
-    $('#track-sub').textContent = `calibrated with ${r.samples.length} samples`;
-    $('#gaze-calstate').textContent = `calibrated · ${r.samples.length} samples`;
+    $('#setup-panel').style.display = 'none';
+    $('#tracking-panel').style.display = '';
+    $('#track-sub').textContent = 'Waiting for a gaze estimateâ€¦';
+    $('#gaze-calstate').textContent = `Calibrated with ${samples.length} points`;
     setGazeOverlayVisible(true);
     $('#btn-toggle-cursor').textContent = 'Hide';
-  } catch (e) {
-    $('#setup-sub').textContent = 'calibration fit failed';
-    ($('#btn-start-cal') as HTMLButtonElement).disabled = false;
-    console.error('[gazeline] calibrate failed', e);
+  } catch (error) {
+    if (owner.signal.aborted) return;
+    candidate.calibrated = tracker.calibrated;
+    candidate.tracking = tracker.calibrated;
+    $('#setup-panel').style.display = candidate.tracking ? 'none' : '';
+    $('#tracking-panel').style.display = candidate.tracking ? '' : 'none';
+    (candidate.tracking ? $('#track-sub') : $('#setup-sub')).textContent = 'Could not fit the gaze model. Centre your face and retry calibration.';
+    $('#gaze-calstate').textContent = candidate.tracking ? 'Previous calibration in use' : 'Calibration needed';
+    setGazeOverlayVisible(candidate.tracking && previousVisibility);
+    console.error('[gazeline] Calibration failed', error);
+  } finally {
+    if (!owner.signal.aborted) {
+      candidate.calibrating = false;
+      button.disabled = false;
+    }
   }
 }
 
-/* ================= tracker  buffer/overlay/readout ================= */
-let lastShownX = 0, lastShownY = 0;
-function onTrackerResult(r: { gaze: { x: number; y: number } | null; facePresent: boolean; faceResult: FaceLandmarkerResult | null }): void {
+function onTrackerResult(r: PredictResult): void {
   const now = performance.now();
   if (r.facePresent) {
     candidate.faceSeenAt = now;
@@ -842,58 +822,44 @@ function onTrackerResult(r: { gaze: { x: number; y: number } | null; facePresent
   }
   $('#gaze-face-2').textContent = r.facePresent ? 'present' : 'lost';
 
-  // Feed face pipeline with blendshapes + transformation matrix
-  if (r.faceResult) {
-    const faceInfo = candidate.facePipeline.process({
-      t: now,
-      result: r.faceResult,
-      facePresent: r.facePresent,
-      frameW: CAL_CAPTURE_W,
-      frameH: CAL_CAPTURE_H,
-      optionalFrameData: null, // frame data not available here; luminance checks use setup gate separately
-    });
-
-    // Feed to setup gate (only before calibration)
-    if (!candidate.tracking && !candidate.calibrating) {
-      candidate.setupGate.feed(faceInfo, CAL_CAPTURE_W, CAL_CAPTURE_H, 30); // approximate fps
+  const inSetup = !candidate.tracking && !candidate.calibrating;
+  const faceInfo = candidate.facePipeline.process({
+    t: now, result: r.faceResult, facePresent: r.facePresent,
+    frameW: CAL_CAPTURE_W, frameH: CAL_CAPTURE_H,
+    optionalFrameData: inSetup ? r.frame : null,
+  });
+  if (inSetup) {
+    candidate.setupGate.feed(faceInfo, CAL_CAPTURE_W, CAL_CAPTURE_H, cameraFps);
+    const button = $('#btn-start-cal') as HTMLButtonElement;
+    // Keep retry/cancel feedback visible until face availability changes.
+    if (button.disabled === r.facePresent || $('#face-badge').textContent === 'Loading gaze trackerâ€¦') {
+      button.disabled = !r.facePresent;
+      $('#setup-sub').textContent = r.facePresent ? 'Ready' : 'Waiting for a faceâ€¦';
     }
-
-    // Feed to face monitor
-    candidate.faceMonitor.process(faceInfo, now);
-
-    // Feed to head pose tracker
+  }
+  const badge = $('#face-badge');
+  badge.textContent = r.facePresent ? 'Face detected' : 'No face';
+  badge.classList.toggle('ok', r.facePresent);
+  badge.classList.toggle('bad', !r.facePresent);
+  candidate.faceMonitor.process(faceInfo, now);
+  candidate.blinkAnalyzer.setContext(r.facePresent, !!candidate.setupQuality && !candidate.setupQuality.lightingOk, false);
+  if (r.faceResult) {
     candidate.headPose.process(faceInfo, now);
-
-    // Feed to blink analyzer
     candidate.blinkAnalyzer.process(faceInfo, now);
-
-    // Update blink context (lighting/face conditions)
-    candidate.blinkAnalyzer.setContext(
-      r.facePresent,
-      candidate.setupQuality ? !candidate.setupQuality.lightingOk : false,
-      false, // glasses glare detection requires frame data
-    );
-  } else {
-    // No face - feed empty info
-    const emptyInfo = candidate.facePipeline.process({
-      t: now,
-      result: null,
-      facePresent: false,
-      frameW: CAL_CAPTURE_W,
-      frameH: CAL_CAPTURE_H,
-      optionalFrameData: null,
-    });
-    candidate.faceMonitor.process(emptyInfo, now);
-    candidate.blinkAnalyzer.setContext(false, false, false);
   }
 
+  if (!candidate.tracking || candidate.calibrating) return;
+  gazeLive = r.gaze !== null;
   if (r.gaze) {
-    lastShownX = clamp(r.gaze.x, 0, window.innerWidth);
-    lastShownY = clamp(r.gaze.y, 0, window.innerHeight);
     pushGaze(r.gaze.x, r.gaze.y, now);
-    $('#gaze-readout-xy').textContent = `${lastShownX.toFixed(0)} / ${lastShownY.toFixed(0)} px`;
+    const { x, y } = visibleGazePoint(r.gaze);
+    $('#gaze-readout-xy').textContent = `${x.toFixed(0)} / ${y.toFixed(0)} px`;
+    $('#track-sub').textContent = 'Receiving gaze estimates';
   } else {
     pushNull(now);
+    clearGazeOverlay();
+    $('#gaze-readout-xy').textContent = 'â€”';
+    $('#track-sub').textContent = r.facePresent ? 'Waiting for a gaze estimateâ€¦' : 'Bring your face back into view.';
   }
 }
 
@@ -995,7 +961,7 @@ function bcPostState(): void {
       readingLik: candidate.reading.likelihood,
       elapsedMs: Date.now() - candidate.startedAt,
       micActive: candidate.micActive,
-      gazeLive: candidate.tracking,
+      gazeLive,
       ts: Date.now(),
       accommodations: candidate.accommodations,
       setupQuality: candidate.setupQuality?.overall ?? 'poor',
@@ -1159,7 +1125,7 @@ function startTimers(): void {
           readingLik: candidate.reading.likelihood,
           elapsedMs: Date.now() - candidate.startedAt,
           micActive: candidate.micActive,
-          gazeLive: candidate.tracking,
+          gazeLive,
           ts: Date.now(),
         },
       });
@@ -1407,20 +1373,24 @@ function toggleTestMode(): void {
 function fixSvgRef(): void { void IFRAME_SVGS.shield; }
 
 /* ================= teardown ================= */
-function candidateTeardown(reason: string): void {
+function stopCandidateDevices(): void {
+  captureSession?.abort();
+  captureSession = null;
   candidate.streaming = false;
   candidate.tracking = false;
+  candidate.calibrating = false;
   candidate.calibrated = false;
-  for (const id of [tickTimer, analysisTimer, faceCheckTimer]) window.clearInterval(id);
-  tickTimer = analysisTimer = faceCheckTimer = 0;
+  candidate.setupOverride = false;
+  candidate.faceSeenAt = candidate.faceLostAt = 0;
+  gazeLive = false;
+  cameraFps = 0;
+  window.clearInterval(tickTimer);
+  window.clearInterval(analysisTimer);
+  tickTimer = analysisTimer = 0;
   if (micRaf) { cancelAnimationFrame(micRaf); micRaf = 0; }
-
-  if (reason === 'logout') {
-    tracker.dispose();
-    stopGazeOverlay();
-  } else {
-    tracker.stop();
-  }
+  candidate.attentionMonitor.stop();
+  tracker.dispose();
+  stopGazeOverlay();
   if (micAnalyser) { try { micAnalyser.disconnect(); } catch { /* ignore */ } micAnalyser = null; }
   if (audioCtx) { try { audioCtx.close(); } catch { /* ignore */ } audioCtx = null; }
   if (mediaStream) {
@@ -1430,6 +1400,17 @@ function candidateTeardown(reason: string): void {
   const vid = document.getElementById('preview-video');
   vid?.remove();
   clearBuffer();
+  $('#gate-live').style.display = 'none';
+  $('#gate-ask').style.display = '';
+  $('#setup-panel').style.display = '';
+  $('#tracking-panel').style.display = 'none';
+  $('#btn-start-cal').textContent = 'Start calibration';
+  $('#gaze-readout-xy').textContent = 'â€”';
+  $('#gaze-fps').textContent = 'â€”';
+}
+
+function candidateTeardown(): void {
+  stopCandidateDevices();
   Object.keys(candidate.flags).forEach((k) => (candidate.flags as Record<string, boolean>)[k] = false);
   candidate.scoreState = initialScoreState(performance.now(), candidate.accommodations);
   candidate.score = 100;
@@ -1453,14 +1434,7 @@ function candidateTeardown(reason: string): void {
   $('#penalty-val').textContent = '-';
   $('#read-lik-fill').style.width = '0%';
   $('#session-clock').textContent = '00:00';
-  if (reason === 'logout') {
-    ($('#gate-live') as HTMLElement).style.display = 'none';
-    ($('#gate-ask') as HTMLElement).style.display = '';
-    ($('#gate-denied') as HTMLElement).style.display = 'none';
-    ($('#setup-panel') as HTMLElement).style.display = '';
-    ($('#tracking-panel') as HTMLElement).style.display = 'none';
-    $('#btn-start-cal')!.textContent = 'Start calibration';
-  }
+  $('#gate-denied').style.display = 'none';
 }
 
 /* ================= mobile detection ================= */

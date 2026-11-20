@@ -1,78 +1,60 @@
-/**
- * gazeOverlay - fixed-position gaze cursor and fading trail on top of the page.
- * Accuracy note: ~120 CSS px after 17-point calibration, so the cursor is a
- * region indicator, not pixel-perfect.
- */
-import { onGaze, type GazeSample } from '../gazeBuffer.js';
+import { onGaze } from '../gazeBuffer.js';
+import { visibleGazePoint } from './viewport.js';
 
-const TRAIL_LEN = 30;
-const EMA_ALPHA = 0.3; // light smoothing
+let cursor: HTMLDivElement | null = null;
+let trail: SVGSVGElement | null = null;
+let enabled = false;
+let unsubscribe: (() => void) | null = null;
+let smoothed: { x: number; y: number } | null = null;
 
-let cursorEl: HTMLDivElement | null = null;
-let trailSvg: SVGSVGElement | null = null;
-let shown = false;
-let unsub: (() => void) | null = null;
-let emaX = 0, emaY = 0, haveEma = false;
-const trail: GazeSample[] = [];
-
-function ensureEls(): void {
-  if (cursorEl && trailSvg) return;
-  cursorEl = document.createElement('div');
-  cursorEl.id = 'gaze-cursor';
-  document.body.appendChild(cursorEl);
-
-  trailSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  trailSvg.id = 'gaze-trail';
-  document.body.appendChild(trailSvg);
-}
-
-export function setGazeOverlayVisible(on: boolean): void {
-  ensureEls();
-  shown = on;
-  if (!cursorEl || !trailSvg) return;
-  cursorEl.style.display = on ? 'block' : 'none';
-  trailSvg.style.display = on ? 'block' : 'none';
-  if (!on) {
-    if (trailSvg) trailSvg.innerHTML = '';
-    trail.length = 0;
+/** Hide stale estimates on face loss and restart smoothing on reacquisition. */
+export function clearGazeOverlay(): void {
+  if (!smoothed) return;
+  smoothed = null;
+  if (cursor && trail) {
+    cursor.style.display = trail.style.display = 'none';
+    trail.replaceChildren();
   }
 }
 
-export function isGazeOverlayVisible(): boolean {
-  return shown;
+export function setGazeOverlayVisible(on: boolean): void {
+  enabled = on;
+  if (!on) clearGazeOverlay();
 }
 
+export function isGazeOverlayVisible(): boolean { return enabled; }
+
 export function startGazeOverlay(): void {
-  ensureEls();
-  if (unsub) return;
-  unsub = onGaze((s) => {
-    if (!haveEma) { emaX = s.x; emaY = s.y; haveEma = true; }
-    emaX = emaX + EMA_ALPHA * (s.x - emaX);
-    emaY = emaY + EMA_ALPHA * (s.y - emaY);
-
-    if (!shown || !cursorEl || !trailSvg) return;
-    cursorEl.style.transform = `translate(${emaX.toFixed(1)}px, ${emaY.toFixed(1)}px)`;
-
-    trail.push({ x: s.x, y: s.y, t: s.t });
-    while (trail.length > TRAIL_LEN) trail.shift();
-    let svg = '';
-    for (let i = 0; i < trail.length; i++) {
-      const p = trail[i]!;
-      const age = (trail.length - i) / TRAIL_LEN; // 1 = newest
-      const r = 2 + age * 3;
-      const o = 0.05 + age * 0.3;
-      svg += `<circle cx="${p.x.toFixed(0)}" cy="${p.y.toFixed(0)}" r="${r.toFixed(1)}" opacity="${o.toFixed(2)}" style="fill:rgba(34,211,238,${o.toFixed(2)})"/>`;
-    }
-    trailSvg.innerHTML = svg;
+  if (unsubscribe) return;
+  cursor = document.createElement('div');
+  cursor.id = 'gaze-cursor';
+  trail = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  trail.id = 'gaze-trail';
+  cursor.setAttribute('aria-hidden', 'true');
+  trail.setAttribute('aria-hidden', 'true');
+  document.body.append(trail, cursor);
+  unsubscribe = onGaze(sample => {
+    if (!enabled || !cursor || !trail) return;
+    const { x, y } = visibleGazePoint(sample);
+    smoothed = smoothed ? { x: smoothed.x + .3 * (x - smoothed.x), y: smoothed.y + .3 * (y - smoothed.y) } : { x, y };
+    cursor.style.transform = `translate(${smoothed.x}px, ${smoothed.y}px)`;
+    cursor.style.display = trail.style.display = 'block';
+    const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    dot.setAttribute('cx', String(x));
+    dot.setAttribute('cy', String(y));
+    dot.setAttribute('r', '3');
+    trail.appendChild(dot);
+    if (trail.childElementCount > 30) trail.firstElementChild!.remove();
   });
 }
 
 export function stopGazeOverlay(): void {
-  unsub?.();
-  unsub = null;
-  haveEma = false;
-  trail.length = 0;
-  if (cursorEl) cursorEl.style.display = 'none';
-  if (trailSvg) { trailSvg.innerHTML = ''; trailSvg.style.display = 'none'; }
+  unsubscribe?.();
+  unsubscribe = null;
+  enabled = false;
+  smoothed = null;
+  cursor?.remove();
+  trail?.remove();
+  cursor = null;
+  trail = null;
 }
-

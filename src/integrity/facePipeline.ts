@@ -194,13 +194,13 @@ export class FacePipeline {
     }
 
     const allLandmarks = result.allLandmarks;
-    const face = allLandmarks?.[0];
-    const numFaces = allLandmarks?.length ?? 0;
+    // RealEye returns one face with a flat array of landmarks.
+    const numFaces = 1;
     const faceConfidence = result.confidence ?? 0;
 
     // Face bounding box from first face's landmarks
     let faceBoxNorm: { x0: number; y0: number; x1: number; y1: number } | null = null;
-    if (face && allLandmarks) {
+    if (allLandmarks?.length) {
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
       for (const lm of allLandmarks) {
         if (lm.x < x0) x0 = lm.x;

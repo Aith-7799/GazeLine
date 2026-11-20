@@ -1,133 +1,141 @@
-/**
- * calibration - full-screen 17-point calibration wizard.
- * One target at a time across the grid; the user looks at it and clicks or
- * holds the spacebar/mouse to capture (with a short dwell so the samples are
- * taken while actually fixating). Progress indicator + redo/restart controls.
- */
-import { calibrationTargets, type GazeTracker } from './tracker.js';
-import type { CalibrationSample } from '@realeye-io/webcam-eyetracker-light-open';
+import { getCalibrationPoints, getRecommendedPattern, type CalibrationSample } from '@realeye-io/webcam-eyetracker-light-open';
+import type { GazeTracker } from './tracker.js';
+import { visibleViewport } from './viewport.js';
 
-export interface CalibrationRunResult {
-  ok: boolean;
-  samples: CalibrationSample[];
-  cancelled: boolean;
-  reason?: string;
-}
+const points = getCalibrationPoints(getRecommendedPattern());
+const settleMs = 450;
+const instructions = 'Keep your head still. Look at the dot, then click it or hold Space.';
 
-const SETTLE_MS = 450;   // target shown before capture becomes armed
-
-export function runCalibrationWizard(tracker: GazeTracker): Promise<CalibrationRunResult> {
-  return new Promise((resolve) => {
-    const overlay = document.createElement('div');
-    overlay.className = 'cal-overlay';
-    overlay.innerHTML = `
-      <div class="cal-progress">
-        <span>Calibration</span>
-        <span class="cal-count" id="cal-count">1 / 17</span>
-        <span style="flex:1"></span>
-        <span style="color:var(--ink2); font-size:12.5px;">Look at each dot, then click it (or hold <span class="mono">space</span> for ~0.6 s)</span>
-      </div>
-      <div class="cal-area" id="cal-area"></div>
-      <div class="cal-hint">Keep your head still and follow the dot with your eyes only.</div>
-      <div class="cal-actions">
-        <button class="btn" id="cal-restart" type="button">Restart calibration</button>
-        <button class="btn btn-ghost" id="cal-cancel" type="button">Cancel</button>
-      </div>
-    `;
-    document.body.appendChild(overlay);
-
-    const area = overlay.querySelector('#cal-area')!;
-    const countEl = overlay.querySelector('#cal-count')!;
-    let pts = calibrationTargets(window.innerWidth, window.innerHeight);
-    let idx = 0;
-    let samples: CalibrationSample[] = [];
-    let cancelled = false;
+export function runCalibrationWizard(
+  tracker: Pick<GazeTracker, 'captureCalibrationSample'>,
+  signal: AbortSignal,
+): Promise<CalibrationSample[] | null> {
+  if (signal.aborted) return Promise.resolve(null);
+  return new Promise(resolve => {
+    const dialog = document.createElement('dialog');
+    dialog.className = 'cal-overlay';
+    dialog.setAttribute('aria-labelledby', 'cal-title');
+    dialog.setAttribute('aria-describedby', 'cal-hint');
+    dialog.innerHTML = `
+      <header class="cal-progress">
+        <strong id="cal-title">Gaze calibration</strong>
+        <span class="cal-count" id="cal-count" aria-live="polite"></span>
+      </header>
+      <div class="cal-area"></div>
+      <footer class="cal-footer">
+        <span class="cal-hint" id="cal-hint" role="status"></span>
+        <div class="cal-actions">
+          <button class="btn" id="cal-restart" type="button">Restart</button>
+          <button class="btn btn-ghost" id="cal-cancel" type="button">Cancel</button>
+        </div>
+      </footer>`;
+    const area = dialog.querySelector<HTMLElement>('.cal-area')!;
+    const count = dialog.querySelector<HTMLElement>('#cal-count')!;
+    const hint = dialog.querySelector<HTMLElement>('#cal-hint')!;
+    const samples: CalibrationSample[] = [];
+    let target: HTMLButtonElement | null = null;
+    let viewport = visibleViewport();
+    let readyAt = 0;
+    let busy = false;
+    let timer = 0;
     let holdTimer = 0;
 
-    function cleanup() {
-      window.removeEventListener('keydown', onSpaceDown);
-      window.removeEventListener('keyup', onSpaceUp);
-      overlay.remove();
+    function showTarget(message = instructions) {
+      window.clearTimeout(timer);
+      window.clearTimeout(holdTimer);
+      busy = false;
+      const point = points[samples.length];
+      const dot = document.createElement('button');
+      dot.type = 'button';
+      dot.className = 'cal-target';
+      dot.setAttribute('aria-label', `Capture point ${samples.length + 1}`);
+      dot.style.left = `${point.x * 100}%`;
+      dot.style.top = `${point.y * 100}%`;
+      dot.addEventListener('click', requestCapture);
+      target = dot;
+      area.replaceChildren(dot);
+      count.textContent = `Point ${samples.length + 1} of ${points.length}`;
+      hint.textContent = message;
+      dot.focus({ preventScroll: true });
+      readyAt = performance.now() + settleMs;
     }
 
-    function targetEl(): HTMLElement {
-      const p = pts[idx]!;
-      const el = document.createElement('div');
-      el.className = 'cal-target';
-      el.style.left = `${p.x}px`;
-      el.style.top = `${p.y}px`;
-      el.innerHTML = '<div class="cal-target-inner"></div>';
-      area.appendChild(el);
-      return el;
-    }
-
-    async function captureAt(i: number, target: HTMLElement): Promise<void> {
-      const p = pts[i]!;
-      const sample = await tracker.captureCalibrationSample(p.x, p.y);
-      if (sample) {
+    function requestCapture() {
+      if (!target || busy) return;
+      busy = true;
+      const dot = target;
+      window.clearTimeout(holdTimer);
+      timer = window.setTimeout(async () => {
+        const box = dot.getBoundingClientRect();
+        let sample: CalibrationSample | null = null;
+        try {
+          sample = await tracker.captureCalibrationSample(box.left + box.width / 2, box.top + box.height / 2);
+        } catch {
+          // The camera can lose a frame between detection and capture.
+        }
+        if (target !== dot) return;
+        if (!sample) {
+          busy = false;
+          hint.textContent = 'Centre your face, look at the same dot and try again.';
+          return;
+        }
         samples.push(sample);
-        target.classList.add('captured');
-        countEl.textContent = `${i + 1} / ${pts.length}`;
-      } else {
-        // camera hiccup - leave target active so the user can click again
-        countEl.textContent = `${i + 1} / ${pts.length} (retry)`;
+        if (samples.length === points.length) { finish(samples); return; }
+        showTarget();
+      }, Math.max(0, readyAt - performance.now()));
+    }
+
+    function updateViewport() {
+      const next = visibleViewport();
+      const changed = next.width !== viewport.width || next.height !== viewport.height ||
+        next.top !== viewport.top || next.left !== viewport.left;
+      Object.assign(dialog.style, {
+        left: `${next.left}px`, top: `${next.top}px`, width: `${next.width}px`, height: `${next.height}px`,
+      });
+      viewport = next;
+      if (changed && target) {
+        const hadSamples = samples.length > 0;
+        samples.length = 0;
+        showTarget(hadSamples ? 'Screen size changed. Start again at this dot.' : instructions);
       }
     }
 
-    async function showTarget() {
-      area.querySelectorAll('.cal-target').forEach((el) => el.remove());
-      if (idx >= pts.length) { finish(true); return; }
-      const p = pts[idx]!;
-      if (!p) { finish(true); return; }
-      const el = targetEl();
-      countEl.textContent = `${idx + 1} / ${pts.length}`;
-      el.addEventListener('click', async () => {
-        if (el.classList.contains('captured')) return;
-        await captureAt(idx, el);
-        idx++;
-        setTimeout(showTarget, 350);
-      });
+    function finish(result: CalibrationSample[] | null) {
+      target = null;
+      window.clearTimeout(timer);
+      window.clearTimeout(holdTimer);
+      window.removeEventListener('resize', updateViewport);
+      window.visualViewport?.removeEventListener('resize', updateViewport);
+      window.visualViewport?.removeEventListener('scroll', updateViewport);
+      signal.removeEventListener('abort', cancel);
+      dialog.close();
+      dialog.remove();
+      resolve(result);
     }
+    function cancel() { finish(null); }
 
-    function onSpaceDown(ev: KeyboardEvent) {
-      if (ev.code !== 'Space' || ev.repeat) return;
+    dialog.addEventListener('keydown', ev => {
+      if (ev.code !== 'Space' || ev.target !== target) return;
       ev.preventDefault();
-      holdTimer = window.setTimeout(async () => {
-        const el = area.querySelector<HTMLElement>('.cal-target:not(.captured)');
-        if (!el) return;
-        await captureAt(idx, el);
-        idx++;
-        setTimeout(showTarget, 350);
-      }, 600);
-    }
-    function onSpaceUp(ev: KeyboardEvent) {
-      if (ev.code !== 'Space') return;
-      clearTimeout(holdTimer);
-    }
-
-    function finish(ok: boolean, reason?: string) {
-      cleanup();
-      if (cancelled) { resolve({ ok: false, samples: [], cancelled: true }); return; }
-      resolve({ ok, samples, cancelled: false, reason });
-    }
-
-    overlay.querySelector('#cal-restart')!.addEventListener('click', () => {
-      samples = [];
-      idx = 0;
-      pts = calibrationTargets(window.innerWidth, window.innerHeight);
-      void showTarget();
+      if (!ev.repeat) holdTimer = window.setTimeout(requestCapture, 600);
     });
-    overlay.querySelector('#cal-cancel')!.addEventListener('click', () => {
-      cancelled = true;
-      cleanup();
-      resolve({ ok: false, samples: [], cancelled: true });
+    dialog.addEventListener('keyup', ev => {
+      if (ev.code === 'Space' && ev.target === target) {
+        ev.preventDefault();
+        window.clearTimeout(holdTimer);
+      }
     });
-    window.addEventListener('keydown', onSpaceDown);
-    window.addEventListener('keyup', onSpaceUp);
-
-    // settle, then start
-    setTimeout(showTarget, SETTLE_MS);
+    dialog.addEventListener('focusout', () => window.clearTimeout(holdTimer));
+    dialog.addEventListener('cancel', ev => { ev.preventDefault(); cancel(); });
+    dialog.querySelector('#cal-cancel')!.addEventListener('click', cancel);
+    dialog.querySelector('#cal-restart')!.addEventListener('click', () => { samples.length = 0; showTarget(); });
+    signal.addEventListener('abort', cancel, { once: true });
+    window.addEventListener('resize', updateViewport);
+    window.visualViewport?.addEventListener('resize', updateViewport);
+    window.visualViewport?.addEventListener('scroll', updateViewport);
+    document.body.appendChild(dialog);
+    dialog.showModal();
+    updateViewport();
+    showTarget();
   });
 }
-
-

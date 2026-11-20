@@ -1,206 +1,135 @@
-/**
- * tracker - thin wrapper around @realeye-io/webcam-eyetracker-light-open that
- * mirrors the pattern from the library's README / apps/demo_app.
- *
- * Also exposes the raw FaceLandmarkerResult (blendshapes + transformationMatrix)
- * so integrity modules can reuse one face pipeline.
- */
 import {
-  WebcamETLight,
-  getRecommendedPattern,
-  getCalibrationPointsInPixels,
-  type CalibrationSample,
-  type GazePoint,
-  type FaceLandmarkerResult,
+  WebcamETLight, type CalibrationSample, type GazePoint, type FaceLandmarkerResult,
 } from '@realeye-io/webcam-eyetracker-light-open';
 
 export type { FaceLandmarkerResult };
-
-const CAL_W = 640;  // capture resolution - the lib resizes eye crops internally
-const CAL_H = 480;
-
-export const CAL_CAPTURE_W = CAL_W;
-export const CAL_CAPTURE_H = CAL_H;
+export const CAL_CAPTURE_W = 640;
+export const CAL_CAPTURE_H = 480;
 
 export interface PredictResult {
   gaze: GazePoint | null;
   facePresent: boolean;
   faceResult: FaceLandmarkerResult | null;
+  frame: ImageData;
 }
 
 export class GazeTracker {
   private tracker: WebcamETLight | null = null;
   private video: HTMLVideoElement | null = null;
-  private canvas: OffscreenCanvas | HTMLCanvasElement | null = null;
-  private ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null;
+  private ctx: CanvasRenderingContext2D | null = null;
   private delegate: 'GPU' | 'CPU' = 'GPU';
-  private rafId = 0;
-  private running = false;
+  private stopFrames: (() => void) | null = null;
 
   onResult: ((r: PredictResult) => void) | null = null;
   onFps: ((fps: number) => void) | null = null;
 
-  get initialized(): boolean {
-    return this.tracker !== null && this.tracker.isReady();
-  }
-  get calibrated(): boolean {
-    return this.tracker !== null && this.tracker.isCalibrated();
-  }
-  get activeDelegate(): 'GPU' | 'CPU' {
-    return this.delegate;
-  }
+  get initialized(): boolean { return this.tracker !== null; }
+  get calibrated(): boolean { return this.tracker?.isCalibrated() ?? false; }
+  get activeDelegate(): 'GPU' | 'CPU' { return this.delegate; }
 
-  async ensureVideo(mediaStream: MediaStream): Promise<HTMLVideoElement> {
-    if (this.video) return this.video;
-    const v = document.createElement('video');
-    v.srcObject = mediaStream;
-    v.muted = true;
-    v.playsInline = true;
-    await new Promise<void>((res) => {
-      v.onloadedmetadata = () => res();
-    });
-    await v.play();
-    this.video = v;
-    return v;
-  }
-
-  /** Initialize with GPU, fall back to CPU on failure (README's guidance). */
-  async initialize(): Promise<void> {
-    this.disposeTracker();
-    const t = new WebcamETLight({ delegate: 'GPU' });
-    try {
-      await t.initialize();
-      this.delegate = 'GPU';
-    } catch (err) {
-      console.warn('[gazeline] GPU init failed, retrying with CPU:', err);
-      this.disposeTracker();
-      const cpu = new WebcamETLight({ delegate: 'CPU' });
-      await cpu.initialize();
-      this.tracker = cpu;
-      this.delegate = 'CPU';
-      return;
+  async initialize(video: HTMLVideoElement, signal: AbortSignal): Promise<void> {
+    this.dispose();
+    this.video = video;
+    const canvas = document.createElement('canvas');
+    canvas.width = CAL_CAPTURE_W;
+    canvas.height = CAL_CAPTURE_H;
+    this.ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!this.ctx) throw new Error('Camera frame capture is unavailable.');
+    for (const delegate of ['GPU', 'CPU'] as const) {
+      signal.throwIfAborted();
+      // The SDK replays still images during fitting. Use the same independent
+      // detection for capture, replay and prediction, even across nonadjacent frames.
+      const engine = new WebcamETLight({ delegate, runningMode: 'IMAGE', wasmPath: '/gaze-runtime' });
+      try {
+        await engine.initialize();
+        signal.throwIfAborted();
+        this.tracker = engine;
+        this.delegate = delegate;
+        return;
+      } catch (error) {
+        engine.dispose();
+        if (signal.aborted || delegate === 'CPU') throw error;
+        console.warn('[gazeline] Retrying gaze initialization on CPU.', error);
+      }
     }
-    this.tracker = t;
   }
 
-  private ensureCanvas() {
-    if (this.canvas) return;
-    const c = document.createElement('canvas');
-    c.width = CAL_W;
-    c.height = CAL_H;
-    this.canvas = c;
-    this.ctx = c.getContext('2d', { willReadFrequently: true });
-  }
-
-  /** Draw the current video frame and return it as ImageData. */
   private grabFrame(): ImageData | null {
-    if (!this.video || !this.video.videoWidth) return null;
-    this.ensureCanvas();
-    if (!this.ctx) return null;
-    // mirror to match the displayed (scaleX(-1)) preview so predicted x maps to screen x
-    this.ctx.save();
-    this.ctx.setTransform(-1, 0, 0, 1, CAL_W, 0);
-    this.ctx.drawImage(this.video, 0, 0, CAL_W, CAL_H);
-    this.ctx.restore();
-    return this.ctx.getImageData(0, 0, CAL_W, CAL_H);
+    const video = this.video;
+    if (!video || !this.ctx || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) return null;
+    // Only the preview is mirrored. The SDK receives the original camera image
+    // both when fitting and predicting, paired with visible CSS pixel coordinates.
+    this.ctx.drawImage(video, 0, 0, CAL_CAPTURE_W, CAL_CAPTURE_H);
+    return this.ctx.getImageData(0, 0, CAL_CAPTURE_W, CAL_CAPTURE_H);
   }
 
-  /** Synchronous face check used by the setup step. */
-  facePresent(): boolean {
-    if (!this.tracker) return false;
-    const frame = this.grabFrame();
-    if (!frame) return false;
-    return this.tracker.detectFace(frame) !== null;
-  }
-
-  /**
-   * Capture one calibration sample: wait ~1 frame, grab the webcam image while
-   * the user is looking at the on-screen target, and pair it with the target's
-   * screen coordinates.
-   */
   async captureCalibrationSample(gazeX: number, gazeY: number): Promise<CalibrationSample | null> {
-    const frame = await new Promise<ImageData | null>((res) => {
-      requestAnimationFrame(() => res(this.grabFrame()));
-    });
-    if (!frame) return null;
-    return { image: frame, gazeX, gazeY };
+    await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    const image = this.grabFrame();
+    if (!image || !this.tracker?.detectFace(image)) return null;
+    return { image, gazeX, gazeY };
   }
 
-  /** Fit the ridge-regression model (demo-app flow: collect samples  calibrate). */
   calibrate(samples: CalibrationSample[]): void {
-    if (!this.tracker) throw new Error('tracker not initialized');
+    if (!this.tracker) throw new Error('The gaze tracker is still loading.');
     this.tracker.calibrate(samples);
   }
 
-  /** Start the rAF prediction loop: every frame  predict  onResult. */
   start(): void {
-    if (this.running || !this.tracker) return;
-    this.running = true;
+    if (this.stopFrames || !this.video || !this.tracker) return;
+    const video = this.video;
     let frames = 0;
-    let fpsT = performance.now();
-    const loop = () => {
-      if (!this.running) return;
-      this.rafId = requestAnimationFrame(loop);
+    let fpsAt = performance.now();
+    let lastTime = -1;
+    const processFrame = () => {
+      if (lastTime === video.currentTime) return;
+      lastTime = video.currentTime;
       const frame = this.grabFrame();
       if (!frame || !this.tracker) return;
-      let gaze: GazePoint | null = null;
-      let facePresent = false;
       let faceResult: FaceLandmarkerResult | null = null;
+      let facePresent = false;
+      let gaze: GazePoint | null = null;
       try {
-        const det = this.tracker.detectFace(frame);
-        facePresent = det !== null;
-        // detectFace returns FaceDetectionResult | FaceLandmarkerResult | null
-        // We want the FaceLandmarkerResult if available (has blendshapes + landmarks)
-        if (det && 'allLandmarks' in det) {
-          faceResult = det as FaceLandmarkerResult;
+        const detection = this.tracker.detectFace(frame);
+        facePresent = detection !== null;
+        if (detection && 'allLandmarks' in detection) faceResult = detection;
+        if (detection && this.tracker.isCalibrated()) {
+          const point = this.tracker.predictWithDetection(frame, detection);
+          if (Number.isFinite(point.x) && Number.isFinite(point.y)) gaze = point;
         }
-        if (this.tracker.isCalibrated() && det) {
-          gaze = this.tracker.predictWithDetection(frame, det);
-        }
-      } catch (e) {
-        // prediction hiccups (face mid-blink etc.) are normal; treat as null
-        gaze = null;
+      } catch {
+        // A missing detection or prediction is a gap in the feed.
       }
       const now = performance.now();
       frames++;
-      if (now - fpsT >= 1000) {
-        this.onFps?.(Math.round((frames * 1000) / (now - fpsT)));
+      if (now - fpsAt >= 1000) {
+        this.onFps?.(Math.round(frames * 1000 / (now - fpsAt)));
         frames = 0;
-        fpsT = now;
+        fpsAt = now;
       }
-      this.onResult?.({ gaze, facePresent, faceResult });
+      this.onResult?.({ gaze, facePresent, faceResult, frame });
     };
-    this.rafId = requestAnimationFrame(loop);
+    if (typeof video.requestVideoFrameCallback === 'function') {
+      const tick = () => { id = video.requestVideoFrameCallback(tick); processFrame(); };
+      let id = video.requestVideoFrameCallback(tick);
+      this.stopFrames = () => video.cancelVideoFrameCallback(id);
+    } else {
+      const tick = () => { id = requestAnimationFrame(tick); processFrame(); };
+      let id = requestAnimationFrame(tick);
+      this.stopFrames = () => cancelAnimationFrame(id);
+    }
   }
 
   stop(): void {
-    this.running = false;
-    if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = 0; }
+    this.stopFrames?.();
+    this.stopFrames = null;
   }
 
-  private disposeTracker(): void {
-    if (this.tracker) {
-      try { this.tracker.dispose(); } catch { /* already disposed */ }
-      this.tracker = null;
-    }
-  }
-
-  /** Cleans up model/WASM resources (README: call dispose() on sign-out). */
   dispose(): void {
     this.stop();
-    this.disposeTracker();
-    this.canvas = null;
+    this.tracker?.dispose();
+    this.tracker = null;
+    this.video = null;
     this.ctx = null;
-    if (this.video) {
-      try { this.video.pause(); } catch { /* ignore */ }
-      this.video.srcObject = null;
-      this.video = null;
-    }
   }
 }
-
-/** Recommended 17-point pattern, converted to screen pixels. */
-export function calibrationTargets(w: number, h: number): { x: number; y: number }[] {
-  return getCalibrationPointsInPixels(getRecommendedPattern(), w, h);
-}
-

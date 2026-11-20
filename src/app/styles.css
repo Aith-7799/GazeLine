@@ -337,40 +337,39 @@ table.data small { color: var(--ink2); font-size: .79rem; }
 .flag-log:empty::before { content: 'No reading deductions yet.'; color: var(--ink2); }
 
 /* ---------- calibration wizard ---------- */
+html:has(.cal-overlay[open]) { overflow: hidden; }
 .cal-overlay {
   color-scheme: dark; --ink0: #f3f8ec; --ink1: #d3e4d8; --accent: #d8f397;
-  --accent-ink: #14251a; --accent-dim: #d8f39730; --bg1: #172d24; --bg2: #223b30;
-  --edge2: #62796a; --risk-low: #9be0b0;
-  position: fixed; inset: 0; z-index: 80;
-  background: rgba(5, 7, 10, 0.97);
-  display: flex; flex-direction: column;
+  --bg1: #172d24; --bg2: #223b30; --edge2: #62796a;
+  position: fixed; inset: auto; margin: 0; max-width: none; max-height: none;
+  border: 0; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  background: #101a17; color: var(--ink0); overflow: hidden;
 }
-.cal-progress {
-  display: flex; align-items: center; gap: 14px; justify-content: center;
-  padding: 18px 20px; color: var(--ink1); font-size: 14px;
-}
-.cal-progress .cal-count { font-family: var(--font-mono); font-size: 15px; color: var(--ink0); }
-.cal-area { position: relative; flex: 1; }
+.cal-overlay[open] { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+.cal-overlay::backdrop { background: #101a17; }
+.cal-progress, .cal-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 10px 20px; }
+.cal-progress { border-bottom: 1px solid #33443b; }
+.cal-count { color: var(--accent); font: .86rem var(--font-mono); }
+.cal-area { position: relative; min-height: 0; margin: 27px; }
 .cal-target {
-  position: absolute; width: 44px; height: 44px; margin: -22px 0 0 -22px;
-  border-radius: 50%; background: var(--bg2); border: 3px solid var(--accent);
-  display: grid; place-items: center; cursor: pointer;
-  transition: transform 120ms ease, box-shadow 120ms ease;
+  position: absolute; transform: translate(-50%, -50%); width: 44px; height: 44px;
+  border-radius: 50%; padding: 0; border: 3px solid var(--accent); background: var(--bg2);
+  display: grid; place-items: center; cursor: pointer; touch-action: manipulation;
 }
-.cal-target:hover { transform: scale(1.15); box-shadow: 0 0 0 6px var(--accent-dim); }
-.cal-target .cal-target-inner { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
-.cal-target.captured { border-color: var(--risk-low); background: rgba(52,211,153,0.15); cursor: default; }
-.cal-target.captured .cal-target-inner { background: var(--risk-low); }
-.cal-target.captured:hover { transform: none; box-shadow: none; }
-.cal-hint {
-  position: absolute; left: 50%; bottom: 26px; transform: translateX(-50%);
-  color: var(--ink1); font-size: 13.5px; background: rgba(7,9,12,0.85);
-  border: 1px solid var(--edge2); border-radius: 999px; padding: 8px 18px; white-space: nowrap;
+.cal-target::after { content: ''; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+.cal-target:focus-visible { outline: 1px solid var(--accent); outline-offset: 3px; }
+.cal-footer { border-top: 1px solid #33443b; }
+.cal-hint { color: var(--ink1); font-size: .875rem; }
+.cal-actions { display: flex; gap: 8px; }
+.cal-actions .btn { color: var(--ink0); border-color: var(--edge2); }
+@media (max-width: 520px) {
+  .cal-progress, .cal-footer { padding: 6px 12px; }
+  .cal-footer { flex-wrap: wrap; }
 }
-.cal-actions {
-  display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; padding: 16px 20px 24px;
+@media (max-height: 300px) {
+  .cal-progress, .cal-footer { padding-block: 2px; font-size: .8rem; }
+  .cal-actions .btn { min-height: 30px; padding: 2px 9px; }
 }
-.cal-overlay .btn-primary:hover { background: #e4f8b4; }
 
 /* ---------- gaze overlay ---------- */
 #gaze-cursor {
@@ -379,8 +378,10 @@ table.data small { color: var(--ink2); font-size: .79rem; }
   box-shadow: 0 0 8px rgba(34, 211, 238, 0.45);
   pointer-events: none; z-index: 200; display: none;
 }
-#gaze-trail { position: fixed; inset: 0; pointer-events: none; z-index: 199; }
-#gaze-trail circle { fill: rgba(34, 211, 238, 0.35); }
+#gaze-trail { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 199; display: none; }
+#gaze-trail circle { fill: #22d3ee; opacity: .35; }
+#gaze-trail circle:nth-last-child(n+7) { opacity: .22; }
+#gaze-trail circle:nth-last-child(n+16) { opacity: .1; }
 
 /* ---------- interviewer ---------- */
 .empty-state {

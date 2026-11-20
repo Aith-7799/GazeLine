@@ -127,10 +127,10 @@ export function buildApp(): void {
     </div>
 
     <div class="panel" id="gate-denied" style="display:none;">
-      <div class="panel-head"><h3 class="panel-title">Monitoring unavailable</h3><span class="panel-sub">Permission not granted</span></div>
+      <div class="panel-head"><h3 class="panel-title">Monitoring unavailable</h3><span class="panel-sub" id="deny-stage">Device access</span></div>
       <div class="panel-body">
         <div class="note-block red" id="deny-reason" role="alert"></div>
-        <p class="text-hint">Enable camera and microphone access in your browser’s site settings, then try again.</p>
+        <p class="text-hint" id="deny-help">Enable camera and microphone access in your browser’s site settings, then try again.</p>
         <button class="btn" id="btn-retry" type="button" style="margin-top:12px;">Try again</button>
       </div>
     </div>
